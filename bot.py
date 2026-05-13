@@ -87,7 +87,7 @@ SEED_DATA = {
         ],
         "المستوى 3": [
             "برمجة تطبيقات", "تطوير نظم", "ذكاء أعمال",
-            "تجارة إلكترونية", "وسائط متعددة", "إدارة خوادم", "أمن شبكات"
+            "تجارة إلكترونية", "وسائط multimedia", "إدارة خوادم", "أمن شبكات"
         ],
         "المستوى 4": [
             "حوسبة سحابية", "تحليل بيانات كبير", "إدارة تقنية",
@@ -338,12 +338,39 @@ def files_view_keyboard(dept_id, level_id, subj_id, ci):
 def admin_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 المستخدمون",        callback_data="adm_users")],
+        [InlineKeyboardButton("📁 إدارة الملفات (حذف)", callback_data="adm_manage_files")],
         [InlineKeyboardButton("📋 السجلات الأخيرة",   callback_data="adm_logs")],
-        [InlineKeyboardButton("📁 آخر الملفات",        callback_data="adm_files")],
         [InlineKeyboardButton("📊 تصدير Excel",        callback_data="adm_excel")],
         [InlineKeyboardButton("⚙️ إدارة الأقسام",     callback_data="adm_depts")],
         [InlineKeyboardButton("🔙 الرئيسية",           callback_data="main")],
     ])
+
+def adm_files_manage_keyboard(page=0):
+    conn = get_conn()
+    # جلب 10 ملفات حسب الصفحة
+    files = conn.execute(
+        "SELECT id, file_name FROM files ORDER BY id DESC LIMIT 10 OFFSET ?", 
+        (page * 10,)
+    ).fetchall()
+    conn.close()
+    
+    kb = []
+    for fid, fname in files:
+        kb.append([
+            InlineKeyboardButton(f"📄 {fname[:25]}", callback_data="none"),
+            InlineKeyboardButton("🗑 حذف", callback_data=f"adm_fdel_{fid}_{page}")
+        ])
+    
+    # أزرار التنقل
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"adm_fpage_{page-1}"))
+    if len(files) == 10:
+        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"adm_fpage_{page+1}"))
+    if nav: kb.append(nav)
+    
+    kb.append([InlineKeyboardButton("🔙 رجوع لوحة الأدمن", callback_data="admin")])
+    return InlineKeyboardMarkup(kb)
 
 
 def adm_depts_keyboard():
@@ -618,6 +645,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin":
         await _admin_main(query)
+        return
+
+    # إدارة حذف الملفات
+    if data == "adm_manage_files":
+        await query.edit_message_text("📁 **إدارة الملفات:**\nاختر الملف الذي تريد حذفه:", 
+                                     reply_markup=adm_files_manage_keyboard(0), parse_mode=HTML)
+        return
+
+    if data.startswith("adm_fpage_"):
+        page = int(data.split("_")[-1])
+        await query.edit_message_text("📁 **إدارة الملفات:**", 
+                                     reply_markup=adm_files_manage_keyboard(page), parse_mode=HTML)
+        return
+
+    if data.startswith("adm_fdel_"):
+        parts = data.split("_")
+        fid, page = int(parts[2]), int(parts[3])
+        conn = get_conn()
+        conn.execute("DELETE FROM files WHERE id=?", (fid,))
+        conn.commit()
+        conn.close()
+        await query.answer("✅ تم حذف الملف بنجاح")
+        await query.edit_message_text("📁 **إدارة الملفات:**", 
+                                     reply_markup=adm_files_manage_keyboard(page), parse_mode=HTML)
         return
 
     if data == "adm_users":
