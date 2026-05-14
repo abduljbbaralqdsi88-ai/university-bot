@@ -5,8 +5,14 @@
 
 import sqlite3
 import os
+import json
+import asyncio
 from datetime import datetime, timedelta
 from io import BytesIO
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+import pytz
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,16 +22,89 @@ from telegram.ext import (
 import pandas as pd
 
 # ============= الإعدادات =============
-TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "8825417900:AAGQ_6i5nk6XpUglRuypiXGTUbrHm2fmZC0")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "1812586002"))
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8825417900:AAGQ_6i5nk6XpUglRuypiXGTUbrHm2fmZC0")
+OWNER_ID = int(os.environ.get("OWNER_ID", "1812586002"))
+GROUP_ID = -1003709487288  # ID القناة
+ADMIN_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admins.json")
+DAILY_MSG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_msg.json")
+SCHEDULE_JOBS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schedule_jobs.json")
+
 CHANNEL_LINK = "https://t.me/+2GOhgqO8jLVlM2Y0"
-DEVELOPER    = "Abduljbbar AL_Qdasi"
+DEVELOPER = "Abduljbbar AL_Qdasi"
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "university_bot.db")
 HTML = "HTML"
 
-CATEGORIES  = ["محاضرات", "ملازم", "واجبات", "اختبارات سابقة", "مشاريع"]
-CAT_EMOJIS  = ["📝", "📋", "✏️", "📊", "🗂"]
+CATEGORIES = ["محاضرات", "ملازم", "واجبات", "اختبارات سابقة", "مشاريع"]
+CAT_EMOJIS = ["📝", "📋", "✏️", "📊", "🗂"]
 
+# توقيت السعودية (UTC+3)
+SAUDI_TZ = pytz.timezone('Asia/Riyadh')
+
+# ============= نظام الصلاحيات =============
+def load_admins():
+    """تحميل بيانات الأدمن من ملف JSON"""
+    if os.path.exists(ADMIN_JSON_PATH):
+        with open(ADMIN_JSON_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"owner": OWNER_ID, "admins": {}}
+
+def save_admins(admins_data):
+    """حفظ بيانات الأدمن إلى ملف JSON"""
+    with open(ADMIN_JSON_PATH, 'w', encoding='utf-8') as f:
+        json.dump(admins_data, f, ensure_ascii=False, indent=2)
+
+def has_permission(user_id, permission):
+    """التحقق من صلاحية المستخدم"""
+    if user_id == OWNER_ID:
+        return True
+    admins_data = load_admins()
+    admin_perms = admins_data.get("admins", {}).get(str(user_id), [])
+    return permission in admin_perms
+
+def add_admin(user_id, permissions):
+    """إضافة أدمن جديد مع صلاحياته"""
+    admins_data = load_admins()
+    admins_data["admins"][str(user_id)] = permissions
+    save_admins(admins_data)
+
+def remove_admin(user_id):
+    """حذف أدمن"""
+    admins_data = load_admins()
+    if str(user_id) in admins_data["admins"]:
+        del admins_data["admins"][str(user_id)]
+        save_admins(admins_data)
+        return True
+    return False
+
+# ============= إدارة الجدولة =============
+def load_schedule_jobs():
+    """تحميل المهام المجدولة"""
+    if os.path.exists(SCHEDULE_JOBS_PATH):
+        with open(SCHEDULE_JOBS_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"weekly": [], "once": [], "daily": None}
+
+def save_schedule_jobs(jobs_data):
+    """حفظ المهام المجدولة"""
+    with open(SCHEDULE_JOBS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(jobs_data, f, ensure_ascii=False, indent=2)
+
+def load_daily_msg():
+    """تحميل رسالة اليومية"""
+    if os.path.exists(DAILY_MSG_PATH):
+        with open(DAILY_MSG_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
+def save_daily_msg(time_str, text):
+    """حفظ رسالة اليومية"""
+    data = {"time": time_str, "text": text, "enabled": True}
+    with open(DAILY_MSG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return data
+
+# أيام الأسبوع
+WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
 
 def h(text: object) -> str:
     """تهريب النص لـ HTML"""
@@ -272,7 +351,7 @@ def main_keyboard(user_id):
         [InlineKeyboardButton("📤 رفع ملف",        callback_data="upload")],
         [InlineKeyboardButton("📢 قناة المكتبة",   url=CHANNEL_LINK)],
     ]
-    if user_id == ADMIN_ID:
+    if has_permission(user_id, "admin"):
         kb.append([InlineKeyboardButton("👑 لوحة الأدمن", callback_data="admin")])
     return InlineKeyboardMarkup(kb)
 
@@ -452,805 +531,220 @@ def confirm_keyboard(yes_cb, no_cb):
     ])
 
 
-# ====================================================================
-#  المعالجات الرئيسية
-# ====================================================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    update_user_sync(user.id, user.username or "", user.first_name, user.last_name or "")
-    log_sync(user.id, "start")
-
-    text = (
-        f"🎓 <b>أهلاً وسهلاً {h(user.first_name)}!</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📚 <b>مكتبة الجامعة الرقمية</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "يمكنك من خلال هذا البوت:\n"
-        "• 🔍 تصفح المواد الدراسية لجميع الأقسام\n"
-        "• 📥 تحميل الملفات (محاضرات، ملازم، واجبات...)\n"
-        "• 📤 رفع ومشاركة ملفاتك مع زملائك\n\n"
-        "📢 انضم لقناتنا (اختياري):\n"
-        f"{CHANNEL_LINK}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👨‍💻 <b>المطور:</b> {h(DEVELOPER)}\n"
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
-    await update.message.reply_text(text, reply_markup=main_keyboard(user.id), parse_mode=HTML)
+def add_admin_permissions_keyboard(user_id):
+    """لوحة اختيار صلاحيات الأدمن"""
+    perms = ["addjob", "deljob", "viewjobs", "editdaily", "delfile", "admin"]
+    perm_names = {
+        "addjob": "➕ إضافة موعد",
+        "deljob": "❌ حذف موعد",
+        "viewjobs": "👀 عرض المواعيد",
+        "editdaily": "✏️ تعديل الرسالة اليومية",
+        "delfile": "🗑 حذف الملفات",
+        "admin": "👑 أدمن كامل"
+    }
+    current_perms = load_admins().get("admins", {}).get(str(user_id), [])
+    kb = []
+    for perm in perms:
+        status = "✅" if perm in current_perms else "⬜"
+        kb.append([InlineKeyboardButton(f"{status} {perm_names[perm]}", callback_data=f"adm_perm_toggle_{user_id}_{perm}")])
+    kb.append([InlineKeyboardButton("✅ تأكيد وحفظ", callback_data=f"adm_perm_save_{user_id}")])
+    kb.append([InlineKeyboardButton("🔙 إلغاء", callback_data="admin")])
+    return InlineKeyboardMarkup(kb)
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user  = update.effective_user
-    data  = query.data
-
-    update_user_sync(user.id, user.username or "", user.first_name, user.last_name or "")
-
-    # ── الرئيسية ──
-    if data == "main":
-        context.user_data.clear()
-        await query.edit_message_text(
-            "🎓 <b>القائمة الرئيسية</b>", reply_markup=main_keyboard(user.id), parse_mode=HTML
-        )
-        return
-
-    # ── تصفح ──
-    if data == "browse":
-        context.user_data.clear()
-        await query.edit_message_text("🏛 <b>اختر القسم:</b>",
-                                      reply_markup=departments_keyboard("b"), parse_mode=HTML)
-        return
-
-    # ── رفع ──
-    if data == "upload":
-        context.user_data.clear()
-        await query.edit_message_text("📤 <b>رفع ملف — اختر القسم:</b>",
-                                      reply_markup=departments_keyboard("u"), parse_mode=HTML)
-        return
-
-    # ── رجوع للأقسام ──
-    if data in ("bdept", "udept"):
-        mode = data[0]
-        txt = "📤 <b>رفع ملف — اختر القسم:</b>" if mode == "u" else "🏛 <b>اختر القسم:</b>"
-        await query.edit_message_text(txt, reply_markup=departments_keyboard(mode), parse_mode=HTML)
-        return
-
-    # ── اختيار قسم ──
-    if data.startswith("bD") or data.startswith("uD"):
-        mode, dept_id = data[0], int(data[2:])
-        dept = db_dept(dept_id)
-        if not dept:
-            await query.edit_message_text("❌ القسم غير موجود.", reply_markup=main_keyboard(user.id), parse_mode=HTML)
-            return
-        _, emoji, name = dept
-        prefix = "📤 <b>رفع ملف — " if mode == "u" else ""
-        suffix = "</b>" if mode == "u" else ""
-        await query.edit_message_text(
-            f"{emoji} <b>{h(name)}</b>{suffix}\n\nاختر المستوى:",
-            reply_markup=levels_keyboard(dept_id, mode), parse_mode=HTML
-        )
-        return
-
-    # ── اختيار مستوى ──
-    if (data.startswith("bL") or data.startswith("uL")) and data.count("_") == 1:
-        mode = data[0]
-        parts = data[2:].split("_")
-        dept_id, level_id = int(parts[0]), int(parts[1])
-        dept  = db_dept(dept_id)
-        level = db_level(level_id)
-        if not dept or not level:
-            await query.edit_message_text("❌ البيانات غير موجودة.", parse_mode=HTML)
-            return
-        _, emoji, dname = dept
-        _, lname, _ = level
-        await query.edit_message_text(
-            f"{emoji} <b>{h(dname)} | {h(lname)}</b>\n\nاختر المادة:",
-            reply_markup=subjects_keyboard(dept_id, level_id, mode), parse_mode=HTML
-        )
-        return
-
-    # ── اختيار مادة ──
-    if (data.startswith("bS") or data.startswith("uS")) and "_" in data:
-        mode = data[0]
-        parts = data[2:].split("_")
-        dept_id, level_id, subj_id = int(parts[0]), int(parts[1]), int(parts[2])
-        subj = db_subject(subj_id)
-        if not subj:
-            await query.edit_message_text("❌ المادة غير موجودة.", parse_mode=HTML)
-            return
-        _, sname, _ = subj
-        await query.edit_message_text(
-            f"📖 <b>{h(sname)}</b>\n\nاختر نوع الملف:",
-            reply_markup=categories_keyboard(dept_id, level_id, subj_id, mode), parse_mode=HTML
-        )
-        return
-
-    # ── عرض الملفات ──
-    if data.startswith("bC") and "_" in data:
-        parts = data[2:].split("_")
-        dept_id, level_id, subj_id, ci = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-        subj = db_subject(subj_id)
-        sname = subj[1] if subj else "؟"
-        cat   = CATEGORIES[ci]
-        log_sync(user.id, "browse", f"{sname}-{cat}")
-
-        conn = get_conn()
-        files = conn.execute(
-            "SELECT file_name, telegram_file_id FROM files WHERE dept_id=? AND level_id=? AND subject_id=? AND cat_idx=?",
-            (dept_id, level_id, subj_id, ci)
-        ).fetchall()
-        conn.close()
-
-        if files:
-            await query.edit_message_text(
-                f"📂 <b>{h(sname)} | {h(cat)}</b>\n\n✅ يوجد <b>{len(files)}</b> ملف، جاري الإرسال...",
-                reply_markup=files_view_keyboard(dept_id, level_id, subj_id, ci), parse_mode=HTML
-            )
-            for fname, fid in files:
-                try:
-                    await context.bot.send_document(chat_id=user.id, document=fid,
-                                                    caption=f"📄 {fname}\n📂 {sname} | {cat}")
-                except Exception:
-                    await query.message.reply_text(f"⚠️ تعذّر إرسال: {fname}")
-        else:
-            await query.edit_message_text(
-                f"📂 <b>{h(sname)} | {h(cat)}</b>\n\n❌ لا توجد ملفات بعد.\n\nكن أول من يساهم! 👇",
-                reply_markup=files_view_keyboard(dept_id, level_id, subj_id, ci), parse_mode=HTML
-            )
-        return
-
-    # ── رجوع لقائمة المواد (من صفحة عرض الملفات، مع 3 شرطات) ──
-    if data.startswith("bL") and data.count("_") == 2:
-        parts = data[2:].split("_")
-        dept_id, level_id = int(parts[0]), int(parts[1])
-        dept  = db_dept(dept_id)
-        level = db_level(level_id)
-        _, emoji, dname = dept or (0, "🏛", "؟")
-        _, lname, _     = level or (0, "؟", 0)
-        await query.edit_message_text(
-            f"{emoji} <b>{h(dname)} | {h(lname)}</b>\n\nاختر المادة:",
-            reply_markup=subjects_keyboard(dept_id, level_id, "b"), parse_mode=HTML
-        )
-        return
-
-    # ── إضافة ملف مباشرةً لقسم محدد ──
-    if data.startswith("uC") and "_" in data:
-        parts = data[2:].split("_")
-        dept_id, level_id, subj_id, ci = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-        subj  = db_subject(subj_id)
-        dept  = db_dept(dept_id)
-        level = db_level(level_id)
-        sname = subj[1]  if subj  else "؟"
-        dname = dept[2]  if dept  else "؟"
-        lname = level[1] if level else "؟"
-        cat   = CATEGORIES[ci]
-
-        context.user_data.update({
-            "awaiting_file": True,
-            "dept_id": dept_id, "level_id": level_id,
-            "subj_id": subj_id, "ci": ci,
-        })
-        await query.edit_message_text(
-            f"📤 <b>رفع ملف</b>\n\n"
-            f"📂 {h(dname)} ‹ {h(lname)} ‹ {h(sname)} ‹ {h(cat)}\n\n"
-            "✅ أرسل الملف الآن:", parse_mode=HTML
-        )
-        return
-
-    # ==================================================================
-    #  لوحة الأدمن
-    # ==================================================================
-    if user.id != ADMIN_ID:
-        return  # تجاهل أي callback أدمن من غير الأدمن
-
-    if data == "admin":
-        await _admin_main(query)
-        return
-
-    # إدارة حذف الملفات
-    if data == "adm_manage_files":
-        await query.edit_message_text("📁 **إدارة الملفات:**\nاختر الملف الذي تريد حذفه:", 
-                                     reply_markup=adm_files_manage_keyboard(0), parse_mode=HTML)
-        return
-
-    if data.startswith("adm_fpage_"):
-        page = int(data.split("_")[-1])
-        await query.edit_message_text("📁 **إدارة الملفات:**", 
-                                     reply_markup=adm_files_manage_keyboard(page), parse_mode=HTML)
-        return
-
-    if data.startswith("adm_fdel_"):
-        parts = data.split("_")
-        fid, page = int(parts[2]), int(parts[3])
-        conn = get_conn()
-        conn.execute("DELETE FROM files WHERE id=?", (fid,))
-        conn.commit()
-        conn.close()
-        await query.answer("✅ تم حذف الملف بنجاح")
-        await query.edit_message_text("📁 **إدارة الملفات:**", 
-                                     reply_markup=adm_files_manage_keyboard(page), parse_mode=HTML)
-        return
-
-    if data == "adm_users":
-        await _adm_users(query)
-        return
-
-    if data == "adm_logs":
-        await _adm_logs(query)
-        return
-
-    if data == "adm_files":
-        await _adm_files(query)
-        return
-
-    if data == "adm_excel":
-        await _adm_excel(query, context, user.id)
-        return
-
-    # ── قائمة الأقسام ──
-    if data == "adm_depts":
-        await query.edit_message_text(
-            "⚙️ <b>إدارة الأقسام</b>\n\nاضغط على قسم لتعديله أو استخدم الأسهم لإعادة الترتيب:",
-            reply_markup=adm_depts_keyboard(), parse_mode=HTML
-        )
-        return
-
-    # ── تفاصيل قسم ──
-    if data.startswith("adm_dep_"):
-        dept_id = int(data.split("_")[-1])
-        dept = db_dept(dept_id)
-        if not dept:
-            await query.answer("القسم غير موجود!", show_alert=True)
-            return
-        _, emoji, name = dept
-        await query.edit_message_text(
-            f"{emoji} <b>{h(name)}</b>\n\nماذا تريد أن تفعل؟",
-            reply_markup=adm_dept_detail_keyboard(dept_id), parse_mode=HTML
-        )
-        return
-
-    # ── تعديل اسم القسم ──
-    if data.startswith("adm_dedit_"):
-        dept_id = int(data.split("_")[-1])
-        context.user_data["admin_action"] = "edit_dept"
-        context.user_data["admin_target"]  = dept_id
-        dept = db_dept(dept_id)
-        await query.edit_message_text(
-            f"✏️ أرسل الاسم الجديد للقسم <b>{h(dept[2]) if dept else ''}</b>:",
-            parse_mode=HTML
-        )
-        return
-
-    # ── تغيير إيموجي القسم ──
-    if data.startswith("adm_demoji_"):
-        dept_id = int(data.split("_")[-1])
-        context.user_data["admin_action"] = "edit_dept_emoji"
-        context.user_data["admin_target"]  = dept_id
-        await query.edit_message_text("🔤 أرسل الإيموجي الجديد للقسم:", parse_mode=HTML)
-        return
-
-    # ── إضافة قسم ──
-    if data == "adm_dadd":
-        context.user_data["admin_action"] = "add_dept"
-        await query.edit_message_text(
-            "➕ أرسل اسم القسم الجديد:\n(سيُضاف بإيموجي 🏛 افتراضي، يمكنك تغييره لاحقاً)", parse_mode=HTML
-        )
-        return
-
-    # ── حذف قسم (تأكيد) ──
-    if data.startswith("adm_ddel_"):
-        dept_id = int(data.split("_")[-1])
-        dept = db_dept(dept_id)
-        name = dept[2] if dept else "؟"
-        await query.edit_message_text(
-            f"⚠️ هل أنت متأكد من حذف قسم <b>{h(name)}</b> وجميع ما فيه؟",
-            reply_markup=confirm_keyboard(f"adm_ddelok_{dept_id}", f"adm_dep_{dept_id}"),
-            parse_mode=HTML
-        )
-        return
-
-    # ── تأكيد الحذف ──
-    if data.startswith("adm_ddelok_"):
-        dept_id = int(data.split("_")[-1])
-        conn = get_conn()
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("DELETE FROM departments WHERE id=?", (dept_id,))
-        conn.commit()
-        conn.close()
-        await query.edit_message_text(
-            "✅ تم حذف القسم.", reply_markup=adm_depts_keyboard(), parse_mode=HTML
-        )
-        return
-
-    # ── تحريك قسم للأعلى / الأسفل ──
-    if data.startswith("adm_dup_") or data.startswith("adm_ddn_"):
-        dept_id  = int(data.split("_")[-1])
-        depts    = db_departments()
-        ids      = [r[0] for r in depts]
-        idx      = ids.index(dept_id) if dept_id in ids else -1
-        if data.startswith("adm_dup_") and idx > 0:
-            db_swap_order("departments", dept_id, ids[idx - 1])
-        elif data.startswith("adm_ddn_") and 0 <= idx < len(ids) - 1:
-            db_swap_order("departments", dept_id, ids[idx + 1])
-        await query.edit_message_text(
-            "⚙️ <b>إدارة الأقسام</b>",
-            reply_markup=adm_depts_keyboard(), parse_mode=HTML
-        )
-        return
-
-    # ── قائمة المستويات ──
-    if data.startswith("adm_levels_"):
-        dept_id = int(data.split("_")[-1])
-        dept = db_dept(dept_id)
-        name = dept[2] if dept else "؟"
-        await query.edit_message_text(
-            f"📚 <b>مستويات {h(name)}</b>:",
-            reply_markup=adm_levels_keyboard(dept_id), parse_mode=HTML
-        )
-        return
-
-    # ── تفاصيل مستوى ──
-    if data.startswith("adm_lev_"):
-        parts = data[8:].split("_")
-        dept_id, level_id = int(parts[0]), int(parts[1])
-        level = db_level(level_id)
-        name = level[1] if level else "؟"
-        await query.edit_message_text(
-            f"📚 <b>{h(name)}</b>\n\nماذا تريد؟",
-            reply_markup=adm_level_detail_keyboard(dept_id, level_id), parse_mode=HTML
-        )
-        return
-
-    # ── تعديل اسم مستوى ──
-    if data.startswith("adm_ledit_"):
-        parts = data[10:].split("_")
-        dept_id, level_id = int(parts[0]), int(parts[1])
-        context.user_data.update({"admin_action": "edit_level", "admin_target": level_id, "admin_dept": dept_id})
-        level = db_level(level_id)
-        await query.edit_message_text(
-            f"✏️ أرسل الاسم الجديد للمستوى <b>{h(level[1]) if level else ''}</b>:", parse_mode=HTML
-        )
-        return
-
-    # ── إضافة مستوى ──
-    if data.startswith("adm_ladd_"):
-        dept_id = int(data.split("_")[-1])
-        context.user_data.update({"admin_action": "add_level", "admin_target": dept_id})
-        await query.edit_message_text("➕ أرسل اسم المستوى الجديد:", parse_mode=HTML)
-        return
-
-    # ── حذف مستوى ──
-    if data.startswith("adm_ldel_"):
-        parts = data[9:].split("_")
-        dept_id, level_id = int(parts[0]), int(parts[1])
-        level = db_level(level_id)
-        name = level[1] if level else "؟"
-        await query.edit_message_text(
-            f"⚠️ حذف المستوى <b>{h(name)}</b> وجميع مواده؟",
-            reply_markup=confirm_keyboard(f"adm_ldelok_{dept_id}_{level_id}", f"adm_lev_{dept_id}_{level_id}"),
-            parse_mode=HTML
-        )
-        return
-
-    if data.startswith("adm_ldelok_"):
-        parts = data[11:].split("_")
-        dept_id, level_id = int(parts[0]), int(parts[1])
-        conn = get_conn()
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("DELETE FROM levels WHERE id=?", (level_id,))
-        conn.commit()
-        conn.close()
-        await query.edit_message_text(
-            "✅ تم حذف المستوى.",
-            reply_markup=adm_levels_keyboard(dept_id), parse_mode=HTML
-        )
-        return
-
-    # ── تحريك مستوى ──
-    if data.startswith("adm_lup_") or data.startswith("adm_ldn_"):
-        parts = data[8:].split("_")
-        dept_id, level_id = int(parts[0]), int(parts[1])
-        levels = db_levels(dept_id)
-        ids    = [r[0] for r in levels]
-        idx    = ids.index(level_id) if level_id in ids else -1
-        if data.startswith("adm_lup_") and idx > 0:
-            db_swap_order("levels", level_id, ids[idx - 1])
-        elif data.startswith("adm_ldn_") and 0 <= idx < len(ids) - 1:
-            db_swap_order("levels", level_id, ids[idx + 1])
-        dept = db_dept(dept_id)
-        name = dept[2] if dept else "؟"
-        await query.edit_message_text(
-            f"📚 <b>مستويات {h(name)}</b>:",
-            reply_markup=adm_levels_keyboard(dept_id), parse_mode=HTML
-        )
-        return
-
-    # ── قائمة المواد ──
-    if data.startswith("adm_subjs_"):
-        parts = data[10:].split("_")
-        dept_id, level_id = int(parts[0]), int(parts[1])
-        level = db_level(level_id)
-        name = level[1] if level else "؟"
-        await query.edit_message_text(
-            f"📖 <b>مواد {h(name)}</b>:",
-            reply_markup=adm_subjects_keyboard(dept_id, level_id), parse_mode=HTML
-        )
-        return
-
-    # ── تفاصيل مادة ──
-    if data.startswith("adm_sub_"):
-        parts = data[8:].split("_")
-        dept_id, level_id, subj_id = int(parts[0]), int(parts[1]), int(parts[2])
-        subj = db_subject(subj_id)
-        name = subj[1] if subj else "؟"
-        await query.edit_message_text(
-            f"📖 <b>{h(name)}</b>\n\nماذا تريد؟",
-            reply_markup=adm_subject_detail_keyboard(dept_id, level_id, subj_id), parse_mode=HTML
-        )
-        return
-
-    # ── تعديل اسم مادة ──
-    if data.startswith("adm_sedit_"):
-        parts = data[10:].split("_")
-        dept_id, level_id, subj_id = int(parts[0]), int(parts[1]), int(parts[2])
-        context.user_data.update({
-            "admin_action": "edit_subject",
-            "admin_target": subj_id,
-            "admin_dept": dept_id, "admin_level": level_id
-        })
-        subj = db_subject(subj_id)
-        await query.edit_message_text(
-            f"✏️ أرسل الاسم الجديد للمادة <b>{h(subj[1]) if subj else ''}</b>:", parse_mode=HTML
-        )
-        return
-
-    # ── إضافة مادة ──
-    if data.startswith("adm_sadd_"):
-        parts = data[9:].split("_")
-        dept_id, level_id = int(parts[0]), int(parts[1])
-        context.user_data.update({
-            "admin_action": "add_subject",
-            "admin_target": level_id,
-            "admin_dept": dept_id, "admin_level": level_id
-        })
-        await query.edit_message_text("➕ أرسل اسم المادة الجديدة:", parse_mode=HTML)
-        return
-
-    # ── حذف مادة ──
-    if data.startswith("adm_sdel_"):
-        parts = data[9:].split("_")
-        dept_id, level_id, subj_id = int(parts[0]), int(parts[1]), int(parts[2])
-        subj = db_subject(subj_id)
-        name = subj[1] if subj else "؟"
-        await query.edit_message_text(
-            f"⚠️ حذف المادة <b>{h(name)}</b>؟",
-            reply_markup=confirm_keyboard(
-                f"adm_sdelok_{dept_id}_{level_id}_{subj_id}",
-                f"adm_sub_{dept_id}_{level_id}_{subj_id}"
-            ), parse_mode=HTML
-        )
-        return
-
-    if data.startswith("adm_sdelok_"):
-        parts = data[11:].split("_")
-        dept_id, level_id, subj_id = int(parts[0]), int(parts[1]), int(parts[2])
-        conn = get_conn()
-        conn.execute("DELETE FROM subjects WHERE id=?", (subj_id,))
-        conn.commit()
-        conn.close()
-        await query.edit_message_text(
-            "✅ تم حذف المادة.",
-            reply_markup=adm_subjects_keyboard(dept_id, level_id), parse_mode=HTML
-        )
-        return
-
-    # ── تحريك مادة ──
-    if data.startswith("adm_sup_") or data.startswith("adm_sdn_"):
-        parts = data[8:].split("_")
-        dept_id, level_id, subj_id = int(parts[0]), int(parts[1]), int(parts[2])
-        subjs = db_subjects(level_id)
-        ids   = [r[0] for r in subjs]
-        idx   = ids.index(subj_id) if subj_id in ids else -1
-        if data.startswith("adm_sup_") and idx > 0:
-            db_swap_order("subjects", subj_id, ids[idx - 1])
-        elif data.startswith("adm_sdn_") and 0 <= idx < len(ids) - 1:
-            db_swap_order("subjects", subj_id, ids[idx + 1])
-        level = db_level(level_id)
-        name = level[1] if level else "؟"
-        await query.edit_message_text(
-            f"📖 <b>مواد {h(name)}</b>:",
-            reply_markup=adm_subjects_keyboard(dept_id, level_id), parse_mode=HTML
-        )
-        return
+def schedule_jobs_keyboard():
+    """لوحة عرض المواعيد"""
+    jobs_data = load_schedule_jobs()
+    kb = []
+    if jobs_data.get("daily"):
+        kb.append([InlineKeyboardButton("📅 الرسالة اليومية", callback_data="adm_job_daily")])
+    for i, job in enumerate(jobs_data.get("weekly", [])):
+        kb.append([InlineKeyboardButton(f"📆 أسبوعي: {WEEKDAYS[job['day']]} {job['time']}", callback_data=f"adm_job_weekly_{i}")])
+    for i, job in enumerate(jobs_data.get("once", [])):
+        kb.append([InlineKeyboardButton(f"⏰ لمرة: {job['datetime']}", callback_data=f"adm_job_once_{i}")])
+    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin")])
+    return InlineKeyboardMarkup(kb)
 
 
 # ====================================================================
-#  إحصائيات الأدمن
+#  أوامر الجدولة
 # ====================================================================
-async def _admin_main(query):
-    conn = get_conn()
-    total_users  = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    blocked      = conn.execute("SELECT COUNT(*) FROM users WHERE is_blocked=1").fetchone()[0]
-    day_ago      = (datetime.now() - timedelta(hours=24)).isoformat()
-    week_ago     = (datetime.now() - timedelta(days=7)).isoformat()
-    active_24h   = conn.execute("SELECT COUNT(*) FROM users WHERE last_active>?", (day_ago,)).fetchone()[0]
-    new_week     = conn.execute("SELECT COUNT(*) FROM users WHERE join_date>?",   (week_ago,)).fetchone()[0]
-    total_files  = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    total_logs   = conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
-    logs_24h     = conn.execute("SELECT COUNT(*) FROM logs WHERE timestamp>?",    (day_ago,)).fetchone()[0]
-    total_depts  = conn.execute("SELECT COUNT(*) FROM departments").fetchone()[0]
-    conn.close()
-
-    text = (
-        "👑 <b>لوحة تحكم الأدمن</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👥 <b>المستخدمون:</b>\n"
-        f"• الإجمالي: <code>{total_users}</code>  |  نشطاء 24h: <code>{active_24h}</code>\n"
-        f"• هذا الأسبوع: <code>{new_week}</code>  |  محظورون: <code>{blocked}</code>\n\n"
-        "📁 <b>الملفات:</b> <code>{}</code>\n"
-        "🏛 <b>الأقسام:</b> <code>{}</code>\n\n"
-        "📋 <b>السجلات:</b> إجمالي <code>{}</code>  |  24h: <code>{}</code>"
-    ).format(total_files, total_depts, total_logs, logs_24h)
-
-    await query.edit_message_text(text, reply_markup=admin_main_keyboard(), parse_mode=HTML)
-
-
-async def _adm_users(query):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT user_id,first_name,username,join_date,last_active FROM users ORDER BY join_date DESC LIMIT 15"
-    ).fetchall()
-    conn.close()
-    lines = ["👥 <b>آخر 15 مستخدم:</b>\n"]
-    for uid, fname, uname, jd, la in rows:
-        lines.append(
-            f"• <b>{h(fname or '')}</b> (@{h(uname or '—')})\n"
-            f"  🆔 <code>{uid}</code> | انضم: {(jd or '')[:10]} | نشط: {(la or '')[:10]}"
-        )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="admin")]])
-    await query.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode=HTML)
-
-
-async def _adm_logs(query):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT l.user_id,u.first_name,l.action,l.timestamp "
-        "FROM logs l LEFT JOIN users u ON l.user_id=u.user_id "
-        "ORDER BY l.timestamp DESC LIMIT 20"
-    ).fetchall()
-    conn.close()
-    labels = {"start": "▶️ بدأ", "browse": "🔍 تصفّح", "upload_file": "📤 رفع", "click": "👆 ضغط"}
-    lines = ["📋 <b>آخر 20 نشاط:</b>\n"]
-    for uid, fname, action, ts in rows:
-        lines.append(f"• {h(fname or str(uid))} | {labels.get(action, action)} | {(ts or '')[11:16]}")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="admin")]])
-    await query.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode=HTML)
-
-
-async def _adm_files(query):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT f.file_name,d.name,s.name,f.cat_idx,f.upload_date "
-        "FROM files f "
-        "LEFT JOIN departments d ON f.dept_id=d.id "
-        "LEFT JOIN subjects s ON f.subject_id=s.id "
-        "ORDER BY f.upload_date DESC LIMIT 20"
-    ).fetchall()
-    conn.close()
-    if not rows:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="admin")]])
-        await query.edit_message_text("📁 لا توجد ملفات.", reply_markup=kb, parse_mode=HTML)
+async def addjob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addjob 0 21:00 نص الرسالة : إضافة موعد أسبوعي"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, "addjob"):
+        await update.message.reply_text("❌ ما عندك صلاحية لإضافة مواعيد.")
         return
-    lines = ["📁 <b>آخر 20 ملف:</b>\n"]
-    for fname, dname, sname, ci, udate in rows:
-        cat = CATEGORIES[ci] if ci is not None and 0 <= ci < len(CATEGORIES) else "؟"
-        lines.append(f"• <b>{h(fname)}</b> | {h(dname or '؟')} | {h(sname or '؟')} | {h(cat)} | {(udate or '')[:10]}")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="admin")]])
-    await query.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode=HTML)
-
-
-async def _adm_excel(query, context, user_id):
-    await query.edit_message_text("⏳ جاري التصدير...")
-    conn = get_conn()
-    users_df = pd.read_sql_query("SELECT * FROM users", conn)
-    logs_df  = pd.read_sql_query("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 2000", conn)
-    files_df = pd.read_sql_query(
-        "SELECT f.*,d.name dept_name,l.name level_name,s.name subject_name "
-        "FROM files f "
-        "LEFT JOIN departments d ON f.dept_id=d.id "
-        "LEFT JOIN levels l ON f.level_id=l.id "
-        "LEFT JOIN subjects s ON f.subject_id=s.id", conn
-    )
-    depts_df = pd.read_sql_query(
-        "SELECT d.emoji,d.name dept,l.name level_name,s.name subject "
-        "FROM departments d "
-        "LEFT JOIN levels l ON l.dept_id=d.id "
-        "LEFT JOIN subjects s ON s.level_id=l.id "
-        "ORDER BY d.sort_order,l.sort_order,s.sort_order", conn
-    )
-    conn.close()
-
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        users_df.to_excel(writer, sheet_name="المستخدمين", index=False)
-        logs_df.to_excel(writer,  sheet_name="السجلات",    index=False)
-        files_df.to_excel(writer, sheet_name="الملفات",    index=False)
-        depts_df.to_excel(writer, sheet_name="هيكل الأقسام", index=False)
-    output.seek(0)
-
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="admin")]])
-    await query.edit_message_text("✅ جاري إرسال الملف...", reply_markup=kb)
-    await context.bot.send_document(
-        chat_id=user_id,
-        document=output,
-        filename=f"library_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        caption=f"📊 تقرير المكتبة\n👨‍💻 {DEVELOPER}"
-    )
-
-
-# ====================================================================
-#  معالج الرسائل النصية (إدارة الأدمن + رفع الملفات)
-# ====================================================================
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user    = update.effective_user
-    ud      = context.user_data
-    action  = ud.get("admin_action")
-
-    # ── إدارة الأدمن: إدخال نص ──
-    if action and user.id == ADMIN_ID:
-        text = (update.message.text or "").strip()
-        if not text:
-            await update.message.reply_text("❌ يرجى إرسال نص غير فارغ.")
-            return
-
-        conn = get_conn()
-        if action == "add_dept":
-            conn.execute("INSERT INTO departments (emoji,name,sort_order) VALUES ('🏛',?,?)",
-                         (text, 999))
-            conn.commit()
-            await update.message.reply_text(f"✅ تمت إضافة قسم: <b>{h(text)}</b>",
-                                            parse_mode=HTML, reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚙️ إدارة الأقسام", callback_data="adm_depts")]]))
-
-        elif action == "edit_dept":
-            conn.execute("UPDATE departments SET name=? WHERE id=?", (text, ud["admin_target"]))
-            conn.commit()
-            await update.message.reply_text(f"✅ تم تعديل اسم القسم إلى: <b>{h(text)}</b>",
-                                            parse_mode=HTML, reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚙️ إدارة الأقسام", callback_data="adm_depts")]]))
-
-        elif action == "edit_dept_emoji":
-            conn.execute("UPDATE departments SET emoji=? WHERE id=?", (text, ud["admin_target"]))
-            conn.commit()
-            await update.message.reply_text(f"✅ تم تغيير الإيموجي إلى: {h(text)}",
-                                            parse_mode=HTML, reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚙️ إدارة الأقسام", callback_data="adm_depts")]]))
-
-        elif action == "add_level":
-            dept_id = ud["admin_target"]
-            conn.execute("INSERT INTO levels (dept_id,name,sort_order) VALUES (?,?,999)", (dept_id, text))
-            conn.commit()
-            await update.message.reply_text(f"✅ تمت إضافة مستوى: <b>{h(text)}</b>",
-                                            parse_mode=HTML, reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📚 إدارة المستويات", callback_data=f"adm_levels_{dept_id}")]]))
-
-        elif action == "edit_level":
-            conn.execute("UPDATE levels SET name=? WHERE id=?", (text, ud["admin_target"]))
-            conn.commit()
-            dept_id = ud.get("admin_dept", 0)
-            await update.message.reply_text(f"✅ تم تعديل اسم المستوى إلى: <b>{h(text)}</b>",
-                                            parse_mode=HTML, reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📚 إدارة المستويات", callback_data=f"adm_levels_{dept_id}")]]))
-
-        elif action == "add_subject":
-            level_id = ud["admin_target"]
-            dept_id  = ud.get("admin_dept", 0)
-            conn.execute("INSERT INTO subjects (level_id,name,sort_order) VALUES (?,?,999)", (level_id, text))
-            conn.commit()
-            await update.message.reply_text(f"✅ تمت إضافة مادة: <b>{h(text)}</b>",
-                                            parse_mode=HTML, reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📖 إدارة المواد", callback_data=f"adm_subjs_{dept_id}_{level_id}")]]))
-
-        elif action == "edit_subject":
-            conn.execute("UPDATE subjects SET name=? WHERE id=?", (text, ud["admin_target"]))
-            conn.commit()
-            dept_id  = ud.get("admin_dept", 0)
-            level_id = ud.get("admin_level", 0)
-            await update.message.reply_text(f"✅ تم تعديل اسم المادة إلى: <b>{h(text)}</b>",
-                                            parse_mode=HTML, reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📖 إدارة المواد", callback_data=f"adm_subjs_{dept_id}_{level_id}")]]))
-
-        conn.close()
-        ud.pop("admin_action", None)
-        return
-
-    # ── رفع ملف من المستخدم ──
-    if ud.get("awaiting_file"):
-        doc   = update.message.document
-        photo = update.message.photo
-        if not doc and not photo:
-            await update.message.reply_text("❌ يرجى إرسال ملف صالح.")
-            return
-
-        for key in ("dept_id", "level_id", "subj_id", "ci"):
-            if key not in ud:
-                await update.message.reply_text("❌ حدث خطأ، ابدأ من جديد /start")
-                ud.clear()
-                return
-
-        if doc:
-            file_name = doc.file_name or f"file_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            file_id   = doc.file_id
-            file_size = doc.file_size or 0
-        else:
-            file      = photo[-1]
-            file_name = f"image_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            file_id   = file.file_id
-            file_size = file.file_size or 0
-
-        dept_id  = ud["dept_id"]
-        level_id = ud["level_id"]
-        subj_id  = ud["subj_id"]
-        ci       = ud["ci"]
-
-        conn = get_conn()
-        conn.execute(
-            "INSERT INTO files (dept_id,level_id,subject_id,cat_idx,file_name,telegram_file_id,file_size,uploaded_by,upload_date) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (dept_id, level_id, subj_id, ci, file_name, file_id, file_size, user.id, datetime.now().isoformat())
-        )
-        conn.commit()
-        conn.close()
-
-        subj  = db_subject(subj_id)
-        sname = subj[1] if subj else "؟"
-        cat   = CATEGORIES[ci]
-        log_sync(user.id, "upload_file", f"{sname}-{cat}-{file_name}")
-
+    
+    args = context.args
+    if len(args) < 3:
         await update.message.reply_text(
-            f"✅ <b>تم رفع الملف بنجاح!</b>\n\n"
-            f"📄 <code>{h(file_name)}</code>\n"
-            f"📏 {round(file_size/1024,1)} KB\n\n"
-            f"📂 {h(sname)} ‹ {h(cat)}\n\n"
-            "🙏 شكراً على مساهمتك!",
-            parse_mode=HTML, reply_markup=main_keyboard(user.id)
+            "⚠️ الاستخدام:\n/addjob [رقم اليوم] [الوقت] [الرسالة]\n\n"
+            "0=الاثنين, 1=الثلاثاء, ..., 6=الأحد\n"
+            "مثال: /addjob 0 21:00 مرحباً بكم في المكتبة"
         )
-        ud.clear()
         return
+    
+    try:
+        day = int(args[0])
+        if day < 0 or day > 6:
+            raise ValueError
+        time_str = args[1]
+        # التحقق من صيغة الوقت
+        datetime.strptime(time_str, "%H:%M")
+        message = " ".join(args[2:])
+        
+        jobs_data = load_schedule_jobs()
+        new_job = {
+            "day": day,
+            "time": time_str,
+            "message": message
+        }
+        jobs_data["weekly"].append(new_job)
+        save_schedule_jobs(jobs_data)
+        
+        await update.message.reply_text(
+            f"✅ تم إضافة موعد أسبوعي:\n"
+            f"📅 اليوم: {WEEKDAYS[day]}\n"
+            f"⏰ الوقت: {time_str}\n"
+            f"📝 الرسالة: {message[:50]}..."
+        )
+    except ValueError:
+        await update.message.reply_text("❌ اليوم يجب أن يكون 0-6، والوقت بصيغة HH:MM")
 
-    # رسالة غير متوقعة
-    await update.message.reply_text(
-        "اضغط /start للعودة للقائمة الرئيسية."
-    )
+
+async def oncejob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/oncejob 2026-10-20 21:00 نص الرسالة : إضافة موعد لمرة واحدة"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, "addjob"):
+        await update.message.reply_text("❌ ما عندك صلاحية لإضافة مواعيد.")
+        return
+    
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "⚠️ الاستخدام:\n/oncejob [التاريخ] [الوقت] [الرسالة]\n\n"
+            "التاريخ بصيغة YYYY-MM-DD\n"
+            "مثال: /oncejob 2026-10-20 21:00 اجتماع المكتبة"
+        )
+        return
+    
+    try:
+        date_str = args[0]
+        time_str = args[1]
+        datetime_str = f"{date_str} {time_str}"
+        # التحقق من الصيغة
+        dt = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M")
+        if dt < datetime.now():
+            await update.message.reply_text("❌ لا يمكن إضافة موعد في الماضي.")
+            return
+        message = " ".join(args[2:])
+        
+        jobs_data = load_schedule_jobs()
+        new_job = {
+            "datetime": datetime_str,
+            "message": message
+        }
+        jobs_data["once"].append(new_job)
+        save_schedule_jobs(jobs_data)
+        
+        await update.message.reply_text(
+            f"✅ تم إضافة موعد لمرة واحدة:\n"
+            f"📅 التاريخ: {datetime_str}\n"
+            f"📝 الرسالة: {message[:50]}..."
+        )
+    except ValueError:
+        await update.message.reply_text("❌ التاريخ بصيغة YYYY-MM-DD والوقت HH:MM")
 
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"[ERROR] {context.error}")
-    if update and update.effective_message:
+async def setdaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setdaily 09:00 نص الرسالة : تعديل الرسالة اليومية"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, "editdaily"):
+        await update.message.reply_text("❌ ما عندك صلاحية لتعديل الرسالة اليومية.")
+        return
+    
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "⚠️ الاستخدام:\n/setdaily [الوقت] [الرسالة]\n\n"
+            "الوقت بصيغة HH:MM\n"
+            "مثال: /setdaily 09:00 صباح الخير"
+        )
+        return
+    
+    try:
+        time_str = args[0]
+        datetime.strptime(time_str, "%H:%M")
+        message = " ".join(args[1:])
+        
+        daily_data = save_daily_msg(time_str, message)
+        
+        await update.message.reply_text(
+            f"✅ تم حفظ الرسالة اليومية:\n"
+            f"⏰ الوقت: {time_str}\n"
+            f"📝 الرسالة: {message[:100]}..."
+        )
+    except ValueError:
+        await update.message.reply_text("❌ الوقت بصيغة HH:MM")
+
+
+async def deljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/deljob اسم_الجدول : حذف موعد معين"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, "deljob"):
+        await update.message.reply_text("❌ ما عندك صلاحية لحذف المواعيد.")
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "⚠️ الاستخدام:\n"
+            "/deljob weekly_0 - لحذف أول موعد أسبوعي\n"
+            "/deljob once_0 - لحذف أول موعد لمرة\n"
+            "/deljob daily - لحذف الرسالة اليومية\n\n"
+            "لعرض قائمة المواعيد استخدم /listjobs"
+        )
+        return
+    
+    job_id = args[0]
+    jobs_data = load_schedule_jobs()
+    
+    if job_id == "daily":
+        if jobs_data.get("daily"):
+            jobs_data["daily"] = None
+            if os.path.exists(DAILY_MSG_PATH):
+                os.remove(DAILY_MSG_PATH)
+            await update.message.reply_text("✅ تم حذف الرسالة اليومية.")
+        else:
+            await update.message.reply_text("❌ لا توجد رسالة يومية محفوظة.")
+    elif job_id.startswith("weekly_"):
         try:
-            await update.effective_message.reply_text(
-                "⚠️ حدث خطأ، يرجى المحاولة مجدداً أو الضغط على /start"
-            )
-        except Exception:
-            pass
+            idx = int(job_id.split("_")[1])
+            if 0 <= idx < len(jobs_data.get("weekly", [])):
+                removed = jobs_data["weekly"].pop(idx)
+                save_schedule_jobs(jobs_data)
+                await update.message.reply_text(f"✅ تم حذف الموعد الأسبوعي (اليوم {WEEKDAYS[removed['day']]}).")
+            else:
+                await update.message.reply_text("❌ الرقم غير صحيح.")
+        except (IndexError, ValueError):
+            await update.message.reply_text("❌ الرقم غير صحيح. استخدم /listjobs لعرض الأرقام.")
+    elif job_id.startswith("once_"):
+        try:
+            idx = int(job_id.split("_")[1])
+            if 0 <= idx < len(jobs_data.get("once", [])):
+                removed = jobs_data["once"].pop(idx)
+                save_schedule_jobs(jobs_data)
+                await update.message.reply_text(f"✅ تم حذف الموعد (التاريخ {removed['datetime']}).")
+            else:
+                await update.message.reply_text("❌ الرقم غير صحيح.")
+        except (IndexError, ValueError):
+            await update.message.reply_text("❌ الرقم غير صحيح. استخدم /listjobs لعرض الأرقام.")
+    else:
+        await update.message.reply_text("❌ الصيغة غير صحيحة. استخدم /listjobs لعرض الأرقام.")
 
 
-# ====================================================================
-#  الدالة الرئيسية
-# ====================================================================
-def main():
-    init_database()
-    print("✅ قاعدة البيانات جاهزة")
-
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_handler))
-    app.add_error_handler(error_handler)
-
-    print(f"✅ البوت يعمل | المطور: {DEVELOPER}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+async def delday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delday 0 : حذف كل مواعيد يوم معين"""
+    user_id = update.effective_user.id
+    if not has_permission(user_id, "del
