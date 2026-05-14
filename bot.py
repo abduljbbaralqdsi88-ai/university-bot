@@ -747,4 +747,4 @@ async def deljob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def delday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/delday 0 : حذف كل مواعيد يوم معين"""
     user_id = update.effective_user.id
-    if not has_permission(user_id, "del)
+    if not has_permission(user_id, "del):
